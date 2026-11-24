@@ -1,0 +1,36 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build:
+    name: Build the app on macOS
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Scripts can be run and parse
+        run: |
+          for f in build.sh tools/make_icon.sh tools/make_cert.sh; do
+            test -x "$f" || { echo "$f is not executable"; exit 1; }
+            zsh -n "$f"
+          done
+
+      - name: Build Retab.app
+        run: ./build.sh
+
+      - name: The bundle is complete and carries the version
+        run: |
+          test -x Retab.app/Contents/MacOS/Retab
+          test -f Retab.app/Contents/Resources/AppIcon.icns
+          built="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Retab.app/Contents/Info.plist)"
+          test "$built" = "$(cat VERSION)" || { echo "bundle says $built, VERSION says $(cat VERSION)"; exit 1; }
+
+      - name: Never asks for Screen Recording
+        run: |
+          if nm -u Retab.app/Contents/MacOS/Retab | grep -i -E 'ScreenCapture|CaptureWindowList|WindowListCreateImage'; then
+            echo "Retab must not use Screen Recording"; exit 1
+          fi
