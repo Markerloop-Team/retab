@@ -1490,8 +1490,9 @@ static void DescribeControls(AXUIElementRef element, int depth, int *budget, NSM
             err = AXUIElementCopyAttributeValue((__bridge AXUIElementRef)w.ax, kAXTitleAttribute, &v);
             if (v) axTitle = CFBridgingRelease(v);
         }
-        [out appendFormat:@"%u  %@  %@\n    shown: %@ | profile: %@\n    accessibility title (error %d): %@\n",
+        [out appendFormat:@"%u  %@  %@%@%@\n    shown: %@ | profile: %@\n    accessibility title (error %d): %@\n",
             w.wid, w.appName, w.near ? @"this space" : (w.ax ? @"other space" : @"other space, NOT reached"),
+            w.minimized ? @", minimized" : @"", w.running.hidden ? @", hidden" : @"",
             w.title, w.profile ?: @"-", err, axTitle];
         if (w.ax && IsChrome(w.running)) {
             int budget = 600;
