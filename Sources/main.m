@@ -111,6 +111,8 @@ static void OnFatalSignal(int sig) {
 @property NSString *title;
 @property NSString *appName;
 @property NSString *profile;   // the Chrome profile, when the title names one
+@property NSString *privateMode;   // "Incognito" or "Guest" (in the browser's language) for a private window
+@property (readonly) BOOL guest;   // ... and which of the two it is
 @property NSImage *icon;
 @property BOOL minimized;
 @property id ax;               // AXUIElementRef, once we have found it
@@ -127,6 +129,9 @@ static void OnFatalSignal(int sig) {
 @property NSString *state;     // "Minimized", "Hidden"
 @end
 @implementation Win
+// Chrome names the mode in its own language; in English, "Guest" is a guest window and anything else
+// in brackets is incognito. In other languages every private window is drawn as incognito.
+- (BOOL)guest { return [self.privateMode caseInsensitiveCompare:@"Guest"] == NSOrderedSame; }
 @end
 
 // Some apps carry invisible direction marks in their names; they upset comparing and measuring.
@@ -149,7 +154,10 @@ static void SplitBrowserTitle(Win *w) {
         for (NSString *d in @[@" - ", @" – ", @" — "]) {
             if ([rest hasPrefix:d] && rest.length > d.length) { w.profile = [rest substringFromIndex:d.length]; break; }
         }
-        if (rest.length == 0 || w.profile) w.title = page;
+        // A private window: "Page - Google Chrome (Incognito)", the word in the browser's language.
+        if (!w.profile && [rest hasPrefix:@" ("] && [rest hasSuffix:@")"] && rest.length > 3)
+            w.privateMode = [rest substringWithRange:NSMakeRange(2, rest.length - 3)];
+        if (rest.length == 0 || w.profile || w.privateMode) w.title = page;
         return;
     }
 }
@@ -212,6 +220,7 @@ static NSDictionary<NSNumber *, id> *AXWindowsByBruteForce(pid_t pid, NSSet<NSNu
 // being looked for, or the time after which to look again (an NSDate) when nothing was found — the
 // toolbar may not have been built yet. Main thread only.
 static NSMutableDictionary<NSNumber *, id> *gToolbarProfile;
+static NSString *const kPrivateMark = @"private:";   // a toolbar label that names a private mode, not a profile
 static void (^gProfileFound)(void);   // tells an open panel that a toolbar gave a profile
 @class BrowserProfile;
 static NSString *ProfileOnToolbar(AXUIElementRef element, int depth, int *budget, NSArray<BrowserProfile *> *profiles);
@@ -333,11 +342,12 @@ static NSArray<Win *> *ListWindows(void) {
         w.icon = running.icon;
         w.running = running;
         SplitBrowserTitle(w);
-        if (!w.profile && w.ax && IsChrome(running) && gToolbarProfile) {
+        if (!w.profile && !w.privateMode && w.ax && IsChrome(running) && gToolbarProfile) {
             id known = gToolbarProfile[@(wid)];
             NSArray<BrowserProfile *> *profiles = ChromeProfiles();
             // A label read earlier counts as long as it still names a profile; renamed, it is read again.
-            if ([known isKindOfClass:NSString.class] && ChromeProfilesNamedIn(known, profiles).count) w.profile = known;
+            if ([known isKindOfClass:NSString.class] && [known hasPrefix:kPrivateMark]) w.privateMode = [known substringFromIndex:kPrivateMark.length];
+            else if ([known isKindOfClass:NSString.class] && ChromeProfilesNamedIn(known, profiles).count) w.profile = known;
             else if (!known || [known isKindOfClass:NSString.class] || ([known isKindOfClass:NSDate.class] && [known timeIntervalSinceNow] < 0)) {
                 gToolbarProfile[@(wid)] = NSNull.null;   // being looked for
                 id el = w.ax;
@@ -498,6 +508,9 @@ static NSString *ProfileOnToolbar(AXUIElementRef element, int depth, int *budget
         if (AXUIElementCopyAttributeValue(element, kAXTitleAttribute, &v) == kAXErrorSuccess && v) {
             NSString *title = CFBridgingRelease(v);
             if ([title isKindOfClass:NSString.class] && title.length && ChromeProfilesNamedIn(title, profiles).count) return title;
+            // A private window says so on the same button (in English: Incognito, Guest).
+            for (NSString *mode in @[@"Incognito", @"Guest"])
+                if ([title isKindOfClass:NSString.class] && [title caseInsensitiveCompare:mode] == NSOrderedSame) return [kPrivateMark stringByAppendingString:title];
         }
         return nil;
     }
@@ -560,6 +573,9 @@ static NSColor *ProfileColor(NSString *name) {
 // What a music app is playing, by the app's bundle id. The apps announce it themselves whenever it
 // changes, to anyone listening; nothing is asked of them, so nothing is known until the first change.
 static NSMutableDictionary<NSString *, NSString *> *gNowPlaying;
+
+// Chrome's own grey for incognito.
+#define kPrivateGrey [NSColor colorWithSRGBRed:0.235 green:0.251 blue:0.263 alpha:1]
 
 static NSColor *TintOf(Win *w) { return w.tint ?: ProfileColor(w.profile); }
 
@@ -708,9 +724,10 @@ static const CGFloat kTitleSize = 34, kSubtitleSize = 16, kPaneRadius = 30;
     NSSize ts = [w.appName sizeWithAttributes:titleAttrs];
     CGFloat tw = MIN(ts.width + 1, room);
     [w.appName drawInRect:NSMakeRect(x, y, tw, ts.height) withAttributes:titleAttrs];
-    if (w.profile) {
-        CGFloat ph = round(subSize * 1.7), pw = [w.profile sizeWithAttributes:pillAttrs].width + ph;
-        if (tw + 14 + pw <= room) DrawPill(w.profile, NSMakeRect(x + tw + 14, y + ts.height / 2 - ph / 2 + 2, pw, ph), TintOf(w), pillAttrs);
+    NSString *pill = w.profile ?: w.privateMode;
+    if (pill) {
+        CGFloat ph = round(subSize * 1.7), pw = [pill sizeWithAttributes:pillAttrs].width + ph;
+        if (tw + 14 + pw <= room) DrawPill(pill, NSMakeRect(x + tw + 14, y + ts.height / 2 - ph / 2 + 2, pw, ph), TintOf(w), pillAttrs);
     }
     // The subtitle says where this icon leads: the window, whose it is, how many more there are,
     // what state it is in and where it is.
@@ -719,6 +736,7 @@ static const CGFloat kTitleSize = 34, kSubtitleSize = 16, kPaneRadius = 30;
     if (playing.length) [parts addObject:playing];
     else if (w.wid && w.title.length && ![CleanName(w.title) isEqual:w.appName]) [parts addObject:w.title];
     if (w.email.length) [parts addObject:w.email];
+    if (w.privateMode) [parts addObject:w.guest ? @"Guest window" : @"Private window"];
     if (w.count > 1) [parts addObject:[NSString stringWithFormat:@"%ld windows", (long)w.count]];
     if (w.state.length) [parts addObject:w.state];
     if (w.place.length) [parts addObject:w.place];
@@ -729,6 +747,42 @@ static const CGFloat kTitleSize = 34, kSubtitleSize = 16, kPaneRadius = 30;
     [sub drawInRect:NSMakeRect(x, y + ts.height + 2, room, subSize * 1.3) withAttributes:subAttrs];
 }
 - (void)setItems:(NSArray<Win *> *)items { [self stopGlide]; _items = items; self.needsDisplay = YES; }
+
+// The incognito figure, white, in a square box (flipped coordinates): a hat with a brim, and under
+// it a pair of round glasses.
+static void DrawIncognito(NSRect r) {
+    CGFloat u = r.size.width;
+    [NSColor.whiteColor set];
+    NSBezierPath *hat = [NSBezierPath bezierPath];   // the crown
+    [hat moveToPoint:NSMakePoint(r.origin.x + u * 0.22, r.origin.y + u * 0.40)];
+    [hat lineToPoint:NSMakePoint(r.origin.x + u * 0.30, r.origin.y + u * 0.06)];
+    [hat lineToPoint:NSMakePoint(r.origin.x + u * 0.70, r.origin.y + u * 0.06)];
+    [hat lineToPoint:NSMakePoint(r.origin.x + u * 0.78, r.origin.y + u * 0.40)];
+    [hat closePath];
+    [hat fill];
+    [[NSBezierPath bezierPathWithRoundedRect:NSMakeRect(r.origin.x, r.origin.y + u * 0.40, u, u * 0.09) xRadius:u * 0.045 yRadius:u * 0.045] fill];   // the brim
+    CGFloat g = u * 0.32, gy = r.origin.y + u * 0.62;   // the glasses
+    NSBezierPath *glasses = [NSBezierPath bezierPathWithOvalInRect:NSMakeRect(r.origin.x + u * 0.06, gy, g, g)];
+    [glasses appendBezierPathWithOvalInRect:NSMakeRect(NSMaxX(r) - u * 0.06 - g, gy, g, g)];
+    [glasses moveToPoint:NSMakePoint(r.origin.x + u * 0.06 + g, gy + g * 0.45)];
+    [glasses lineToPoint:NSMakePoint(NSMaxX(r) - u * 0.06 - g, gy + g * 0.45)];
+    glasses.lineWidth = u * 0.09;
+    [glasses stroke];
+}
+
+// A guest: a head and shoulders, white, in a square box (flipped coordinates).
+static void DrawGuest(NSRect r) {
+    CGFloat u = r.size.width;
+    [NSColor.whiteColor setFill];
+    [[NSBezierPath bezierPathWithOvalInRect:NSMakeRect(NSMidX(r) - u * 0.2, r.origin.y + u * 0.02, u * 0.4, u * 0.4)] fill];
+    NSBezierPath *shoulders = [NSBezierPath bezierPath];
+    [shoulders moveToPoint:NSMakePoint(r.origin.x + u * 0.08, NSMaxY(r))];
+    [shoulders curveToPoint:NSMakePoint(NSMaxX(r) - u * 0.08, NSMaxY(r))
+              controlPoint1:NSMakePoint(r.origin.x + u * 0.08, r.origin.y + u * 0.42)
+              controlPoint2:NSMakePoint(NSMaxX(r) - u * 0.08, r.origin.y + u * 0.42)];
+    [shoulders closePath];
+    [shoulders fill];
+}
 
 static void DrawPill(NSString *text, NSRect pill, NSColor *fill, NSDictionary *attrs) {
     NSMutableDictionary *readable = [attrs mutableCopy];
@@ -794,6 +848,18 @@ static void DrawPill(NSString *text, NSRect pill, NSColor *fill, NSDictionary *a
                 NSString *letter = [w.profile substringWithRange:[w.profile rangeOfComposedCharacterSequenceAtIndex:0]].localizedUppercaseString;
                 DrawPill(letter, disc, TintOf(w), letterAttrs);
             }
+        }
+        // A private window: a dark disc with the incognito figure — a hat and glasses — or, for a
+        // guest, the outline of a person.
+        else if (w.privateMode) {
+            CGFloat d = 24 * s;
+            NSRect disc = NSMakeRect(NSMaxX(icon) - inset - d * 0.62, NSMaxY(icon) - inset - d * 0.62, d, d);
+            [[NSColor colorWithWhite:0 alpha:0.35] setFill];
+            [[NSBezierPath bezierPathWithOvalInRect:NSInsetRect(disc, -1.5 * s, -1.5 * s)] fill];
+            [kPrivateGrey setFill];
+            [[NSBezierPath bezierPathWithOvalInRect:disc] fill];
+            if (w.guest) DrawGuest(NSInsetRect(disc, d * 0.2, d * 0.2));
+            else DrawIncognito(NSInsetRect(disc, d * 0.2, d * 0.2));
         }
         // What the app shows on its Dock icon, on the upper corner, as the Dock has it.
         if (w.badge.length) {
@@ -1097,7 +1163,7 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
     if (_demo) {   // the demo cannot read real profiles; pretend, so that their labels can be seen
         NSArray<NSString *> *sample = @[@"Personal", @"Work", @"Client"];
         NSUInteger k = 0;
-        for (Win *w in sorted) if ([w.appName isEqual:@"Google Chrome"]) w.profile = sample[k++ % sample.count];
+        for (Win *w in sorted) if ([w.appName isEqual:@"Google Chrome"] && !w.privateMode) w.profile = sample[k++ % sample.count];
     }
 
     // It stands for the most recently used window of that app or profile, so the icons come in the
@@ -1115,9 +1181,11 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
             w.profileDir = profile.dir;
             if (profile.name.length) w.profile = profile.name;   // the profile's own name: shorter than "Account (profile)"
         }
-        NSString *key = [NSString stringWithFormat:@"%d|%@|%@", w.pid, w.profile ?: @"", profile.dir ?: @""];
+        NSString *key = w.privateMode ? [NSString stringWithFormat:@"%d|private|%@", w.pid, w.privateMode]
+                                      : [NSString stringWithFormat:@"%d|%@|%@", w.pid, w.profile ?: @"", profile.dir ?: @""];
         [withWindows addObject:@(w.pid)];
         if (byGroup[key]) { byGroup[key].count++; continue; }
+        if (w.privateMode) w.tint = kPrivateGrey;
         w.group = key;
         w.count = 1;
         w.badge = DockBadge(w.pid);
@@ -1283,8 +1351,8 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
         if (error) Log(@"drop: could not open %lu item(s) in %@: %@", (unsigned long)urls.count, w.appName, error.localizedDescription);
     };
     Log(@"drop: %lu item(s) on %@%@", (unsigned long)urls.count, w.appName, w.profileDir ? @" (a profile)" : @"");
-    if (IsChrome(w.running) && w.profileDir) {
-        NSMutableArray<NSString *> *args = [NSMutableArray arrayWithObject:[@"--profile-directory=" stringByAppendingString:w.profileDir]];
+    if (IsChrome(w.running) && (w.profileDir || w.privateMode)) {
+        NSMutableArray<NSString *> *args = [NSMutableArray arrayWithObject:w.privateMode ? (w.guest ? @"--guest" : @"--incognito") : [@"--profile-directory=" stringByAppendingString:w.profileDir]];
         for (NSURL *u in urls) [args addObject:u.absoluteString];
         config.arguments = args;
         config.createsNewApplicationInstance = YES;   // the new instance hands the links to the running Chrome and quits
@@ -1546,7 +1614,7 @@ static void DescribeControls(AXUIElementRef element, int depth, int *budget, NSM
         [out appendFormat:@"%u  %@  %@%@%@\n    shown: %@ | profile: %@\n    accessibility title (error %d): %@\n",
             w.wid, w.appName, w.near ? @"this space" : (w.ax ? @"other space" : @"other space, NOT reached"),
             w.minimized ? @", minimized" : @"", w.running.hidden ? @", hidden" : @"",
-            w.title, w.profile ?: @"-", err, axTitle];
+            w.title, w.profile ?: (w.privateMode ? [NSString stringWithFormat:@"(private: %@)", w.privateMode] : @"-"), err, axTitle];
         if (w.ax && IsChrome(w.running)) {
             int budget = 600;
             DescribeControls((__bridge AXUIElementRef)w.ax, 0, &budget, out);
