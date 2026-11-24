@@ -156,7 +156,13 @@ static void SplitBrowserTitle(Win *w) {
 // An app tells accessibility only about its windows on the current Space. The others can still be
 // reached by asking for its interface elements one number at a time and keeping the windows.
 // Slow (a few hundred questions), so it runs off the main thread and its finds are remembered.
-static NSDictionary<NSNumber *, id> *AXWindowsByBruteForce(pid_t pid, NSSet<NSNumber *> *wanted, BOOL *complete) {
+// Where windows were found before: "pid:window" -> element number. Kept in the preferences, so that a
+// Retab started again finds the windows of apps still running at once. Element numbers stay as long
+// as the app runs; a restarted app gets a new pid, and the old entries simply miss.
+static NSString *const kElementNumbers = @"elementNumbers";
+
+static NSDictionary<NSNumber *, id> *AXWindowsByBruteForce(pid_t pid, NSSet<NSNumber *> *wanted, NSArray<NSNumber *> *hints, BOOL hintsOnly,
+                                                        NSMutableDictionary<NSNumber *, NSNumber *> *numbers, BOOL *complete) {
     // Element numbers grow as an app makes elements, and a browser makes a great many: a window
     // opened late can carry a number in the tens of thousands. The search runs off the main thread,
     // stops as soon as every wanted window is found, and gives up after a few seconds.
@@ -167,9 +173,14 @@ static NSDictionary<NSNumber *, id> *AXWindowsByBruteForce(pid_t pid, NSSet<NSNu
     memcpy(token, &p, 4); memcpy(token + 4, &zero, 4); memcpy(token + 8, &magic, 4);
     CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
     *complete = NO;
-    uint64_t i = 0;
-    for (; i <= kLastNumber; i++) {
-        if ((i & 255) == 0 && CFAbsoluteTimeGetCurrent() - start > 3.0) break;
+    // The numbers windows had before come first; then all of them, in order.
+    NSMutableArray<NSNumber *> *order = [hints mutableCopy] ?: [NSMutableArray array];
+    NSUInteger fromHints = order.count;
+    uint64_t i = 0, k = 0;
+    for (;; k++) {
+        if (k < fromHints) i = order[k].unsignedLongLongValue;
+        else { if (hintsOnly) break; i = k - fromHints; if (i > kLastNumber) break; }
+        if ((k & 255) == 0 && CFAbsoluteTimeGetCurrent() - start > 3.0) break;
         memcpy(token + 12, &i, 8);
         CFDataRef data = CFDataCreate(NULL, token, sizeof(token));
         AXUIElementRef el = _AXUIElementCreateWithRemoteToken(data);
@@ -183,14 +194,15 @@ static NSDictionary<NSNumber *, id> *AXWindowsByBruteForce(pid_t pid, NSSet<NSNu
             if (([subrole isEqual:(id)kAXStandardWindowSubrole] || [subrole isEqual:(id)kAXDialogSubrole])
                 && _AXUIElementGetWindow(el, &wid) == kAXErrorSuccess && wid && !found[@(wid)]) {
                 found[@(wid)] = (__bridge id)el;
+                numbers[@(wid)] = @(i);
                 if (wanted.count && [wanted isSubsetOfSet:[NSSet setWithArray:found.allKeys]]) { CFRelease(el); break; }
             }
         }
         CFRelease(el);
     }
-    *complete = i > kLastNumber;
-    Log(@"search in pid %d: %llu numbers in %.0f ms, %lu windows found, %lu of %lu wanted",
-        pid, i, (CFAbsoluteTimeGetCurrent() - start) * 1000, (unsigned long)found.count,
+    *complete = k >= fromHints && i > kLastNumber;
+    Log(@"search in pid %d (%lu remembered): %llu numbers in %.0f ms, %lu windows found, %lu of %lu wanted",
+        pid, (unsigned long)fromHints, k, (CFAbsoluteTimeGetCurrent() - start) * 1000, (unsigned long)found.count,
         (unsigned long)[wanted objectsPassingTest:^BOOL(NSNumber *w, BOOL *stop) { return found[w] != nil; }].count, (unsigned long)wanted.count);
     return found;
 }
@@ -199,6 +211,7 @@ static NSDictionary<NSNumber *, id> *AXWindowsByBruteForce(pid_t pid, NSSet<NSNu
 // being looked for, or the time after which to look again (an NSDate) when nothing was found — the
 // toolbar may not have been built yet. Main thread only.
 static NSMutableDictionary<NSNumber *, id> *gToolbarProfile;
+static void (^gProfileFound)(void);   // tells an open panel that a toolbar gave a profile
 @class BrowserProfile;
 static NSString *ProfileOnToolbar(AXUIElementRef element, int depth, int *budget, NSArray<BrowserProfile *> *profiles);
 static NSArray<BrowserProfile *> *ChromeProfiles(void);
@@ -333,6 +346,7 @@ static NSArray<Win *> *ListWindows(void) {
                     NSString *label = ProfileOnToolbar((__bridge AXUIElementRef)el, 0, &budget, profiles);
                     dispatch_async(dispatch_get_main_queue(), ^{
                         gToolbarProfile[@(number)] = label ?: (id)[NSDate dateWithTimeIntervalSinceNow:10];
+                        if (label && gProfileFound) gProfileFound();
                         Log(@"window %u: profile %@ on its toolbar", number, label ? @"found" : @"not found, will look again");
                     });
                 });
@@ -851,6 +865,8 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *re
     gFarWindows = [NSMutableDictionary dictionary];
     gUnreachedWindows = [NSMutableDictionary dictionary];
     gToolbarProfile = [NSMutableDictionary dictionary];
+    __weak AppDelegate *weakSelf = self;
+    gProfileFound = ^{ [weakSelf refreshOpenSwitch]; };
     gNotWindows = [NSMutableSet set];
 
     _statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
@@ -1102,12 +1118,25 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
     return icons;
 }
 
+// Keeps where windows were found, for the next run; entries of apps no longer running are dropped.
+- (void)rememberElementNumbers:(NSDictionary<NSNumber *, NSNumber *> *)numbers ofApp:(NSNumber *)pid {
+    if (!numbers.count) return;
+    NSMutableSet<NSString *> *running = [NSMutableSet set];
+    for (NSRunningApplication *app in NSWorkspace.sharedWorkspace.runningApplications) [running addObject:[NSString stringWithFormat:@"%d", app.processIdentifier]];
+    NSMutableDictionary *all = [NSMutableDictionary dictionary];
+    [[NSUserDefaults.standardUserDefaults dictionaryForKey:kElementNumbers] enumerateKeysAndObjectsUsingBlock:^(NSString *key, id n, BOOL *stop) {
+        if ([running containsObject:[key componentsSeparatedByString:@":"].firstObject]) all[key] = n;
+    }];
+    for (NSNumber *wid in numbers) all[[NSString stringWithFormat:@"%@:%@", pid, wid]] = numbers[wid];
+    [NSUserDefaults.standardUserDefaults setObject:all forKey:kElementNumbers];
+}
+
 // The search found windows while the panel is up: rebuild the row with them, keeping the selection.
 - (void)refreshOpenSwitch {
     if (!_active) return;
     NSString *chosen = (_selected >= 0 && _selected < (NSInteger)_items.count) ? _items[_selected].group : nil;
     NSArray<Win *> *icons = [self iconsFrom:ListWindows()];
-    if (icons.count == _items.count) return;
+    if ([[icons valueForKey:@"group"] isEqual:[_items valueForKey:@"group"]]) return;   // nothing new to show
     _items = icons;
     _selected = 0;
     for (NSInteger i = 0; i < (NSInteger)icons.count; i++) if ([icons[i].group isEqual:chosen]) { _selected = i; break; }
@@ -1328,9 +1357,36 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
         if (lastTry[pid] && CFAbsoluteTimeGetCurrent() - lastTry[pid].doubleValue < 10) continue;   // a long search is not run on every switch
         [_searching addObject:pid];
         NSSet<NSNumber *> *these = [wanted[pid] copy];
+        NSDictionary *remembered = [NSUserDefaults.standardUserDefaults dictionaryForKey:kElementNumbers] ?: @{};
+        NSMutableArray<NSNumber *> *hints = [NSMutableArray array];
+        NSMutableSet<NSNumber *> *givenUp = [NSMutableSet set];
+        for (NSNumber *wid in these) {
+            NSNumber *n = remembered[[NSString stringWithFormat:@"%@:%@", pid, wid]];
+            if (![n isKindOfClass:NSNumber.class]) continue;
+            if (n.integerValue < 0) { [givenUp addObject:wid]; [gNotWindows addObject:wid]; }   // given up on in an earlier run
+            else [hints addObject:n];
+        }
+        NSMutableSet<NSNumber *> *stillWanted = [these mutableCopy];
+        [stillWanted minusSet:givenUp];
+        these = stillWanted;
+        if (!these.count) { [_searching removeObject:pid]; continue; }
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             BOOL complete = NO;
-            NSDictionary<NSNumber *, id> *found = AXWindowsByBruteForce(pid.intValue, these, &complete);
+            NSMutableDictionary<NSNumber *, NSNumber *> *numbers = [NSMutableDictionary dictionary];
+            // First only where the windows were last time: quick, and shown at once.
+            if (hints.count) {
+                BOOL unused = NO;
+                NSDictionary<NSNumber *, id> *quick = AXWindowsByBruteForce(pid.intValue, these, hints, YES, numbers, &unused);
+                if (quick.count) dispatch_async(dispatch_get_main_queue(), ^{
+                    [gFarWindows addEntriesFromDictionary:quick];
+                    [self refreshOpenSwitch];
+                });
+                if ([these isSubsetOfSet:[NSSet setWithArray:quick.allKeys]]) {
+                    dispatch_async(dispatch_get_main_queue(), ^{ [self->_searching removeObject:pid]; [lastTry removeObjectForKey:pid]; });
+                    return;
+                }
+            }
+            NSDictionary<NSNumber *, id> *found = AXWindowsByBruteForce(pid.intValue, these, hints, NO, numbers, &complete);
             BOOL all = [these isSubsetOfSet:[NSSet setWithArray:found.allKeys]];
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self->_searching removeObject:pid];
@@ -1347,8 +1403,10 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
                     if (!complete && n < 2) continue;
                     [gNotWindows addObject:wid];
                     [misses removeObjectForKey:wid];
+                    numbers[wid] = @(-1);   // remembered for the next run too
                     Log(@"window %@ of pid %@ is not a real window; leaving it out", wid, pid);
                 }
+                [self rememberElementNumbers:numbers ofApp:pid];
                 if (found.count) [self refreshOpenSwitch];
             });
         });
