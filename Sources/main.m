@@ -692,6 +692,16 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *re
     _recent = [NSMutableArray array];
     // `Retab --dump <file>` asks this running copy to write its diagnostics there. For debugging;
     // the file holds window titles, so whoever asks for it should also delete it.
+    // `Retab --show` asks this running copy to put the panel up for two seconds, as if the keys
+    // were held. For debugging the panel without touching the keyboard.
+    [NSDistributedNotificationCenter.defaultCenter addObserverForName:@"app.retab.mac.show" object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
+        if (self->_active) return;
+        self->_demo = NO;
+        [self beginSwitch:NO];
+        [self->_releaseTimer invalidate];   // nobody is holding a key: keep it up on a timer instead
+        self->_releaseTimer = nil;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [self endSwitch]; });
+    }];
     [NSDistributedNotificationCenter.defaultCenter addObserverForName:@"app.retab.mac.dump" object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
         if ([note.object isKindOfClass:NSString.class]) [[self diagnostics] writeToFile:note.object atomically:YES encoding:NSUTF8StringEncoding error:nil];
     }];
@@ -1021,21 +1031,19 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
     _shown = NO;
     _round++;
     _items = nil;
-    if (!_panel.isVisible) return;
-    NSUInteger round = _round;
-    CALayer *layer = _panel.contentView.layer;
-    if (!layer) { [_panel orderOut:nil]; return; }
+    // The panel leaves with a short fade and is then thrown away; the next switch makes a new one.
+    SwitcherPanel *panel = _panel;
+    _panel = nil;
+    if (!panel.isVisible) return;
+    CALayer *layer = panel.contentView.layer;
+    if (!layer) { [panel orderOut:nil]; return; }
     [CATransaction begin];
-    [CATransaction setCompletionBlock:^{
-        if (self->_round != round) return;   // the next switch has already begun: the panel is its business now
-        [self->_panel orderOut:nil];
-        [layer removeAllAnimations];
-    }];
+    [CATransaction setCompletionBlock:^{ [panel orderOut:nil]; }];
     CABasicAnimation *leave = [CABasicAnimation animationWithKeyPath:@"opacity"];
     leave.fromValue = @1;
     leave.toValue = @0;
     leave.duration = 0.07;
-    leave.fillMode = kCAFillModeForwards;   // stays faded until the window is really gone
+    leave.fillMode = kCAFillModeForwards;   // stays faded until the window is gone
     leave.removedOnCompletion = NO;
     [layer addAnimation:leave forKey:@"leave"];
     [CATransaction commit];
@@ -1045,6 +1053,9 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
 - (void)switcherView:(SwitcherView *)view clicked:(NSInteger)index { _selected = index; [self commit]; }
 
 - (void)showPanel {
+    // A new window for every switch. One that lived on through changes of Spaces and screens —
+    // a full-screen window closing, a display going away — can end up where it is never seen
+    // again, while everything else goes on working.
     if (!_panel) {
         _panel = [[SwitcherPanel alloc] initWithContentRect:NSMakeRect(0, 0, 400, 200)
                                                   styleMask:NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
@@ -1113,6 +1124,17 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
         [layer addAnimation:arrive forKey:@"arrive"];
     }
     _shown = YES;
+    // A record of what the panel looks like a moment after it is put up, to catch it being there
+    // and yet not seen.
+    NSUInteger round = _round;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (self->_round != round) return;
+        CALayer *l = self->_panel.contentView.layer;
+        Log(@"panel: visible %d onscreen %d alpha %.2f layer %.2f shown-as %.2f animations %@ frame %@ on %@ space-active %d",
+            self->_panel.isVisible, (self->_panel.occlusionState & NSWindowOcclusionStateVisible) != 0, self->_panel.alphaValue,
+            l.opacity, l.presentationLayer ? l.presentationLayer.opacity : -1, l.animationKeys ?: @[],
+            NSStringFromRect(self->_panel.frame), self->_panel.screen.localizedName, self->_panel.isOnActiveSpace);
+    });
 }
 
 // Finds the windows on other Spaces that accessibility has not told us about, so that they get
@@ -1252,6 +1274,10 @@ int main(int argc, const char *argv[]) {
             for (Win *w in ListWindows())
                 printf("%u\tpid %d\t%s\t[%s]\t%s%s\n", w.wid, w.pid, w.appName.UTF8String, (w.profile ?: @"").UTF8String,
                        w.title.UTF8String, w.near ? "" : (w.ax ? "\t(other space)" : "\t(other space, not reached yet)"));
+            return 0;
+        }
+        if (argc > 1 && strcmp(argv[1], "--show") == 0) {
+            [NSDistributedNotificationCenter.defaultCenter postNotificationName:@"app.retab.mac.show" object:nil userInfo:nil deliverImmediately:YES];
             return 0;
         }
         if (argc > 2 && strcmp(argv[1], "--dump") == 0) {
