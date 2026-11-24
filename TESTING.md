@@ -31,6 +31,7 @@ the Mac and macOS version, and ✅ / ❌ / — (not tried). Two helpers make it 
 | 9 | Closing a full-screen window does not make the panel disappear afterwards | |
 | 10 | Many apps: the row shrinks and wraps; many windows of one app: still one icon | 30+ apps, 40 windows |
 | 11 | Two displays: the panel opens on the display with the pointer | |
+| 11a | Drag a file from Finder, press Command-Tab, drop it on an app's icon: it opens there; drop a link on a Chrome profile's icon: it opens in that profile; let go of Command over an icon mid-drag: Retab switches and the drag goes on | |
 
 ## Chrome profiles
 
