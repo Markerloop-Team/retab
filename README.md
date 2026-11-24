@@ -21,6 +21,7 @@ Three Chrome windows from three profiles are one icon in Command-Tab. You switch
 - **Hold Command, press Tab.** A panel shows one icon per app, and one per browser profile. Let go to switch.
 - **Shift-Tab and the arrow keys** move around; **Escape** cancels; the mouse works too.
 - **A quick tap** switches to the app or profile used before this one, without the panel.
+- **Drop on an icon.** Drag a file or a link, press Command-Tab on the way and drop it on an icon: it opens in that app. Dropped on a Chrome profile, it opens in that profile. Let go of Command over an icon instead, and Retab switches to it with the drag still in hand.
 - Above the icons, a title and a subtitle say where the selected icon leads: the window's title, the profile's account, how many windows there are, whether it is minimised or full screen, and which desktop it is on.
 - The red numbers apps put on their Dock icons — unread messages — are on the icons here too.
 - For Music and Spotify the subtitle shows what is playing, from the next track change on.

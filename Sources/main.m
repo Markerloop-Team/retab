@@ -122,6 +122,7 @@ static void OnFatalSignal(int sig) {
 @property NSImage *avatar;     // a browser profile's account picture, when it can be told
 @property NSString *email;     // ... and its account
 @property NSColor *tint;       // ... and its colour in the browser; ours when the browser gives none
+@property NSString *profileDir; // ... and its folder, to open things in that very profile
 @property NSString *place;     // "Desktop 2", "Full screen"
 @property NSString *state;     // "Minimized", "Hidden"
 @end
@@ -573,6 +574,7 @@ static NSColor *TextOn(NSColor *fill) {
 @protocol SwitcherViewDelegate
 - (void)switcherView:(SwitcherView *)view hovered:(NSInteger)index;
 - (void)switcherView:(SwitcherView *)view clicked:(NSInteger)index;
+- (void)switcherView:(SwitcherView *)view dropped:(NSArray<NSURL *> *)urls on:(NSInteger)index;
 @end
 
 @interface SwitcherView : NSView
@@ -629,6 +631,30 @@ static const CGFloat kTitleSize = 34, kSubtitleSize = 16, kPaneRadius = 30;
 - (void)mouseDown:(NSEvent *)e {
     NSInteger i = [self indexAt:[self convertPoint:e.locationInWindow fromView:nil]];
     if (i >= 0) [_delegate switcherView:self clicked:i];
+}
+
+// Files and links can be dropped on an icon, as on the system's switcher: something dragged from
+// Finder or a browser, Command-Tab pressed on the way, the pointer over an icon, let go — it opens
+// in that app. Hovering selects the icon, so letting go of Command instead simply switches to it
+// and the drag goes on into its window.
+- (NSArray<NSURL *> *)droppedURLs:(id<NSDraggingInfo>)info {
+    return [info.draggingPasteboard readObjectsForClasses:@[NSURL.class] options:nil] ?: @[];
+}
+
+- (NSDragOperation)dragAt:(id<NSDraggingInfo>)info {
+    NSInteger i = [self indexAt:[self convertPoint:info.draggingLocation fromView:nil]];
+    if (i < 0 || ![self droppedURLs:info].count) return NSDragOperationNone;
+    if (i != _selected) [_delegate switcherView:self hovered:i];
+    return NSDragOperationCopy;
+}
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)info { return [self dragAt:info]; }
+- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)info { return [self dragAt:info]; }
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)info {
+    NSInteger i = [self indexAt:[self convertPoint:info.draggingLocation fromView:nil]];
+    NSArray<NSURL *> *urls = [self droppedURLs:info];
+    if (i < 0 || !urls.count) return NO;
+    [_delegate switcherView:self dropped:urls on:i];
+    return YES;
 }
 
 - (CGFloat)headerHeight { return kTitleSize * 1.22 + kSubtitleSize * 1.3 + 16; }
@@ -1086,6 +1112,7 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
             w.avatar = profile.picture;
             w.email = profile.email;
             w.tint = profile.color;
+            w.profileDir = profile.dir;
             if (profile.name.length) w.profile = profile.name;   // the profile's own name: shorter than "Account (profile)"
         }
         NSString *key = [NSString stringWithFormat:@"%d|%@|%@", w.pid, w.profile ?: @"", profile.dir ?: @""];
@@ -1242,6 +1269,31 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
 - (void)switcherView:(SwitcherView *)view hovered:(NSInteger)index { _selected = index; view.selected = index; }
 - (void)switcherView:(SwitcherView *)view clicked:(NSInteger)index { _selected = index; [self commit]; }
 
+// What was dropped on an icon opens in that app. On a Chrome profile it opens in that profile:
+// Chrome is asked, the way its own command line is, to open the links in that profile's folder.
+- (void)switcherView:(SwitcherView *)view dropped:(NSArray<NSURL *> *)urls on:(NSInteger)index {
+    if (index < 0 || index >= (NSInteger)_items.count) return;
+    Win *w = _items[index];
+    [self endSwitch];
+    NSURL *app = w.running.bundleURL;
+    if (!app) return;
+    NSWorkspaceOpenConfiguration *config = [NSWorkspaceOpenConfiguration configuration];
+    config.activates = YES;
+    void (^done)(NSRunningApplication *, NSError *) = ^(NSRunningApplication *a, NSError *error) {
+        if (error) Log(@"drop: could not open %lu item(s) in %@: %@", (unsigned long)urls.count, w.appName, error.localizedDescription);
+    };
+    Log(@"drop: %lu item(s) on %@%@", (unsigned long)urls.count, w.appName, w.profileDir ? @" (a profile)" : @"");
+    if (IsChrome(w.running) && w.profileDir) {
+        NSMutableArray<NSString *> *args = [NSMutableArray arrayWithObject:[@"--profile-directory=" stringByAppendingString:w.profileDir]];
+        for (NSURL *u in urls) [args addObject:u.absoluteString];
+        config.arguments = args;
+        config.createsNewApplicationInstance = YES;   // the new instance hands the links to the running Chrome and quits
+        [NSWorkspace.sharedWorkspace openApplicationAtURL:app configuration:config completionHandler:done];
+        return;
+    }
+    [NSWorkspace.sharedWorkspace openURLs:urls withApplicationAtURL:app configuration:config completionHandler:done];
+}
+
 - (void)showPanel {
     // A new window for every switch. One that lived on through changes of Spaces and screens —
     // a full-screen window closing, a display going away — can end up where it is never seen
@@ -1266,6 +1318,7 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
         _view = [SwitcherView new];
         _view.delegate = self;
         _view.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+        [_view registerForDraggedTypes:@[NSPasteboardTypeFileURL, NSPasteboardTypeURL]];
         [content addSubview:_view];
         _panel.contentView = content;
     }
