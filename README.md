@@ -79,6 +79,10 @@ macOS ties permissions to an app's signature, and a plain build gets a new one e
 - `Retab.app/Contents/MacOS/Retab --demo picture.png` shows the panel once, saves a picture of it and quits; it touches no shortcut and needs no permission.
 - **Copy Diagnostics** in the menu puts what Retab sees on the clipboard. It includes window titles, so read it before you paste it anywhere.
 
+## Testing
+
+There are no automated tests yet; [TESTING.md](TESTING.md) is the list to go through by hand before a release, with what has been checked on which Mac.
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).
