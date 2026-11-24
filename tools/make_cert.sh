@@ -31,7 +31,11 @@ security set-keychain-settings "$KEYCHAIN"            # never locks by itself
 security unlock-keychain -p $PASS "$KEYCHAIN"
 security import "$WORK/id.p12" -k "$KEYCHAIN" -P $PASS -T /usr/bin/codesign >/dev/null
 # codesign finds a certificate only in the keychains macOS searches; add this one to the list.
-security list-keychains -d user -s $(security list-keychains -d user | tr -d '"') "$KEYCHAIN"
+# One path per line, so that a path with a space in it stays one path.
+existing=("${(@f)$(security list-keychains -d user | sed -e 's/^[[:space:]]*"//' -e 's/"$//')}")
+if (( ! ${existing[(Ie)$KEYCHAIN]} )); then
+  security list-keychains -d user -s "${existing[@]}" "$KEYCHAIN"
+fi
 # Without this, macOS asks for the keychain password each time the key is used.
 security set-key-partition-list -S apple-tool:,apple: -s -k $PASS "$KEYCHAIN" >/dev/null
 echo "Made \"Retab Dev\" in $KEYCHAIN. Run ./build.sh again."

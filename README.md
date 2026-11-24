@@ -75,6 +75,7 @@ macOS ties permissions to an app's signature, and a plain build gets a new one e
 ## For debugging
 
 - `Retab.app/Contents/MacOS/Retab --list` prints the windows Retab would offer.
+- `Retab.app/Contents/MacOS/Retab --show` puts the panel of the running Retab up for two seconds, without touching the keyboard; how it went is in the log.
 - `Retab.app/Contents/MacOS/Retab --demo picture.png` shows the panel once, saves a picture of it and quits; it touches no shortcut and needs no permission.
 - **Copy Diagnostics** in the menu puts what Retab sees on the clipboard. It includes window titles, so read it before you paste it anywhere.
 
