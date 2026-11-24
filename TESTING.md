@@ -66,7 +66,7 @@ the Mac and macOS version, and ✅ / ❌ / — (not tried). Two helpers make it 
 | 8 | ✅ | a minimized window and a hidden app's windows are listed as such |
 | 9 | ✅ | by the owner, after the fix of 25 Nov |
 | 10 | ✅ | 40 icons wrap into two rows. Listing with 30 extra apps running: 75 ms. Once, under that load, the panel's log said "visible, not on screen"; not seen again |
-| 11 | — | one display only |
+| 11 | ✅ | by the owner, a built-in display and an external XV272U: the log shows the panel opening on one and then the other |
 | 12 | ✅ | by the owner: Fun, Personal, markerloop.com |
 | 13 | ✅ | by the owner |
 | 14 | — | |
