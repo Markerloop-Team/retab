@@ -121,16 +121,20 @@ static void SplitBrowserTitle(Win *w) {
 // An app tells accessibility only about its windows on the current Space. The others can still be
 // reached by asking for its interface elements one number at a time and keeping the windows.
 // Slow (a few hundred questions), so it runs off the main thread and its finds are remembered.
-static NSDictionary<NSNumber *, id> *AXWindowsByBruteForce(pid_t pid, BOOL *complete) {
+static NSDictionary<NSNumber *, id> *AXWindowsByBruteForce(pid_t pid, NSSet<NSNumber *> *wanted, BOOL *complete) {
+    // Element numbers grow as an app makes elements, and a browser makes a great many: a window
+    // opened late can carry a number in the tens of thousands. The search runs off the main thread,
+    // stops as soon as every wanted window is found, and gives up after a few seconds.
+    static const uint64_t kLastNumber = 200000;
     NSMutableDictionary *found = [NSMutableDictionary dictionary];
     uint8_t token[20];
     int32_t p = pid, zero = 0, magic = 0x636f636f;
     memcpy(token, &p, 4); memcpy(token + 4, &zero, 4); memcpy(token + 8, &magic, 4);
     CFAbsoluteTime start = CFAbsoluteTimeGetCurrent();
     *complete = NO;
-    for (uint64_t i = 0; ; i++) {
-        if (i == 1000) { *complete = YES; break; }
-        if (CFAbsoluteTimeGetCurrent() - start > 0.6) break;
+    uint64_t i = 0;
+    for (; i <= kLastNumber; i++) {
+        if ((i & 255) == 0 && CFAbsoluteTimeGetCurrent() - start > 3.0) break;
         memcpy(token + 12, &i, 8);
         CFDataRef data = CFDataCreate(NULL, token, sizeof(token));
         AXUIElementRef el = _AXUIElementCreateWithRemoteToken(data);
@@ -145,13 +149,24 @@ static NSDictionary<NSNumber *, id> *AXWindowsByBruteForce(pid_t pid, BOOL *comp
                 && _AXUIElementGetWindow(el, &wid) == kAXErrorSuccess && wid) found[@(wid)] = (__bridge id)el;
         }
         CFRelease(el);
+        if (wanted.count && [wanted isSubsetOfSet:[NSSet setWithArray:found.allKeys]]) break;
     }
+    *complete = i > kLastNumber;
+    Log(@"search in pid %d: %llu numbers in %.0f ms, %lu windows found, %lu of %lu wanted",
+        pid, i, (CFAbsoluteTimeGetCurrent() - start) * 1000, (unsigned long)found.count,
+        (unsigned long)[wanted objectsPassingTest:^BOOL(NSNumber *w, BOOL *stop) { return found[w] != nil; }].count, (unsigned long)wanted.count);
     return found;
 }
 
+// Profiles read off browser toolbars, by window number; an empty string while being looked for or
+// when none was found. Main thread only. ProfileOnToolbar is further down, with the profiles.
+static NSMutableDictionary<NSNumber *, NSString *> *gToolbarProfile;
+static NSString *ProfileOnToolbar(AXUIElementRef element, int depth, int *budget);
+
 // Windows found that way, by window id. Main thread only.
 static NSMutableDictionary<NSNumber *, id> *gFarWindows;
-static NSMutableSet<NSNumber *> *gUnreachedApps;   // apps with windows we cannot even name yet
+// Windows we cannot even name yet, by app: pid -> window numbers. Main thread only.
+static NSMutableDictionary<NSNumber *, NSMutableSet<NSNumber *> *> *gUnreachedWindows;
 // Things that look like windows on another Space but that the app itself does not count among its
 // windows: hidden helpers, off-screen caches. Switching to one does nothing, so they are left out.
 static NSMutableSet<NSNumber *> *gNotWindows;
@@ -231,6 +246,8 @@ static NSArray<Win *> *ListWindows(void) {
             }
             w.ax = el;
             w.near = YES;
+            // Remembered, so that the window keeps its name once its Space is left behind.
+            if (gFarWindows) gFarWindows[@(wid)] = el;
         } else {
             // Not known to the app's accessibility on this Space: either a window on another Space
             // (real, and it has a title), or one of the invisible helper windows apps keep around.
@@ -241,7 +258,12 @@ static NSArray<Win *> *ListWindows(void) {
                 // Retab never looks at the screen, so the system gives it no titles of other apps'
                 // windows. A window on another Space is shown once accessibility has reached it;
                 // until then its app is noted for the search.
-                if (WindowIsOnSomeSpace(wid)) [gUnreachedApps addObject:@(pid)];
+                // Small ones are an app's helper windows — a browser's tab strip, a toolbar — not
+                // windows anybody switches to.
+                if (bounds.size.width >= 300 && bounds.size.height >= 200 && WindowIsOnSomeSpace(wid) && gUnreachedWindows) {
+                    if (!gUnreachedWindows[@(pid)]) gUnreachedWindows[@(pid)] = [NSMutableSet set];
+                    [gUnreachedWindows[@(pid)] addObject:@(wid)];
+                }
                 continue;
             }
         }
@@ -252,6 +274,23 @@ static NSArray<Win *> *ListWindows(void) {
         w.icon = running.icon;
         w.running = running;
         SplitBrowserTitle(w);
+        if (!w.profile && w.ax && [running.bundleIdentifier hasPrefix:@"com.google.Chrome"] && gToolbarProfile) {
+            NSString *known = gToolbarProfile[@(wid)];
+            if (known.length) w.profile = known;
+            else if (!known) {
+                gToolbarProfile[@(wid)] = @"";   // being looked for
+                id el = w.ax;
+                CGWindowID number = wid;
+                dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+                    int budget = 500;
+                    NSString *label = ProfileOnToolbar((__bridge AXUIElementRef)el, 0, &budget);
+                    dispatch_async(dispatch_get_main_queue(), ^{
+                        gToolbarProfile[@(number)] = label ?: @"";
+                        Log(@"window %u: profile %@ on its toolbar", number, label ? @"found" : @"not found");
+                    });
+                });
+            }
+        }
         if (!w.title.length) w.title = w.appName;
         [out addObject:w];
     }
@@ -365,6 +404,33 @@ static NSArray<BrowserProfile *> *ChromeProfilesNamed(NSString *label) {
         [all filteredArrayUsingPredicate:[NSPredicate predicateWithBlock:^BOOL(BrowserProfile *p, id b) { return [p.givenName isEqual:label] || [p.fullName isEqual:label]; }]]];
     for (NSArray<BrowserProfile *> *found in tries) if (found.count) return found;
     return @[];
+}
+
+// A browser window whose title says nothing — Chrome leaves it empty for some windows on another
+// Space — still shows its profile on the toolbar's profile button. Its label is looked for among the
+// window's buttons; one that names a known profile is the answer. Walks part of the window's
+// accessibility tree, so it runs off the main thread, once per window.
+static NSString *ProfileOnToolbar(AXUIElementRef element, int depth, int *budget) {
+    if (depth > 10 || *budget <= 0) return nil;
+    (*budget)--;
+    CFTypeRef v = NULL;
+    NSString *role = nil;
+    if (AXUIElementCopyAttributeValue(element, kAXRoleAttribute, &v) == kAXErrorSuccess && v) role = CFBridgingRelease(v);
+    if ([role isEqual:@"AXWebArea"] || [role isEqual:@"AXTabGroup"] || [role isEqual:@"AXScrollArea"]) return nil;   // the page and the tabs are not it
+    if ([role isEqual:(id)kAXButtonRole]) {
+        v = NULL;
+        if (AXUIElementCopyAttributeValue(element, kAXTitleAttribute, &v) == kAXErrorSuccess && v) {
+            NSString *title = CFBridgingRelease(v);
+            if ([title isKindOfClass:NSString.class] && title.length && ChromeProfilesNamed(title).count) return title;
+        }
+        return nil;
+    }
+    CFTypeRef children = NULL;
+    if (AXUIElementCopyAttributeValue(element, kAXChildrenAttribute, &children) != kAXErrorSuccess || !children) return nil;
+    NSString *found = nil;
+    for (id child in (__bridge NSArray *)children) if ((found = ProfileOnToolbar((__bridge AXUIElementRef)child, depth + 1, budget))) break;
+    CFRelease(children);
+    return found;
 }
 
 // The profile a browser window belongs to. Two profiles with the same name get the very same title,
@@ -716,7 +782,8 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *re
     }
     _searching = [NSMutableSet set];
     gFarWindows = [NSMutableDictionary dictionary];
-    gUnreachedApps = [NSMutableSet set];
+    gUnreachedWindows = [NSMutableDictionary dictionary];
+    gToolbarProfile = [NSMutableDictionary dictionary];
     gNotWindows = [NSMutableSet set];
 
     _statusItem = [NSStatusBar.systemStatusBar statusItemWithLength:NSVariableStatusItemLength];
@@ -727,6 +794,11 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *re
 
     [NSWorkspace.sharedWorkspace.notificationCenter addObserver:self selector:@selector(appActivated:)
                                                            name:NSWorkspaceDidActivateApplicationNotification object:nil];
+    // On a new Space its windows are within reach: list them, so that they are remembered by name.
+    [NSWorkspace.sharedWorkspace.notificationCenter addObserverForName:NSWorkspaceActiveSpaceDidChangeNotification object:nil
+                                                                 queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *n) {
+        if (self->_trusted && !self->_active) [self reachFarWindows:ListWindows()];
+    }];
 
     // No app may keep us waiting for long, hung or not.
     AXUIElementRef systemWide = AXUIElementCreateSystemWide();
@@ -1141,23 +1213,35 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
 // their full title (and with it the Chrome profile) and can be raised properly.
 - (void)reachFarWindows:(NSArray<Win *> *)windows {
     if (!AXIsProcessTrusted()) return;
-    NSMutableSet<NSNumber *> *pids = [NSMutableSet set];
-    for (Win *w in windows) if (!w.ax) [pids addObject:@(w.pid)];
-    [pids unionSet:gUnreachedApps];
-    [gUnreachedApps removeAllObjects];
-    for (NSNumber *pid in pids) {
+    NSMutableDictionary<NSNumber *, NSMutableSet<NSNumber *> *> *wanted = [NSMutableDictionary dictionary];
+    for (Win *w in windows) if (!w.ax) {
+        if (!wanted[@(w.pid)]) wanted[@(w.pid)] = [NSMutableSet set];
+        [wanted[@(w.pid)] addObject:@(w.wid)];
+    }
+    for (NSNumber *pid in gUnreachedWindows) {
+        if (!wanted[pid]) wanted[pid] = [NSMutableSet set];
+        [wanted[pid] unionSet:gUnreachedWindows[pid]];
+    }
+    [gUnreachedWindows removeAllObjects];
+    static NSMutableDictionary<NSNumber *, NSNumber *> *lastTry;   // pid -> when its search last came back empty-handed
+    if (!lastTry) lastTry = [NSMutableDictionary dictionary];
+    for (NSNumber *pid in wanted) {
         if ([_searching containsObject:pid]) continue;
+        if (lastTry[pid] && CFAbsoluteTimeGetCurrent() - lastTry[pid].doubleValue < 10) continue;   // a long search is not run on every switch
         [_searching addObject:pid];
+        NSSet<NSNumber *> *these = [wanted[pid] copy];
         dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
             BOOL complete = NO;
-            NSDictionary<NSNumber *, id> *found = AXWindowsByBruteForce(pid.intValue, &complete);
+            NSDictionary<NSNumber *, id> *found = AXWindowsByBruteForce(pid.intValue, these, &complete);
+            BOOL all = [these isSubsetOfSet:[NSSet setWithArray:found.allKeys]];
             dispatch_async(dispatch_get_main_queue(), ^{
                 [self->_searching removeObject:pid];
                 [gFarWindows addEntriesFromDictionary:found];
+                if (all) [lastTry removeObjectForKey:pid]; else lastTry[pid] = @(CFAbsoluteTimeGetCurrent());
                 // Having asked the app about everything it has: what it did not name is not a window.
-                if (complete) for (Win *w in windows) if (w.pid == pid.intValue && !w.ax && !found[@(w.wid)]) {
-                    [gNotWindows addObject:@(w.wid)];
-                    Log(@"window %u of %@ is not a real window; leaving it out", w.wid, w.appName);
+                if (complete) for (NSNumber *wid in these) if (!found[wid]) {
+                    [gNotWindows addObject:wid];
+                    Log(@"window %@ of pid %@ is not a real window; leaving it out", wid, pid);
                 }
                 for (Win *w in self->_items) {
                     if (w.ax || !found[@(w.wid)]) continue;
