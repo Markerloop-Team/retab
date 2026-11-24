@@ -34,6 +34,8 @@ Chrome writes the profile into each window's title; Retab reads it and looks the
 
 Changes you make in Chrome — a new colour, a new picture, a renamed profile — show up within a minute.
 
+Incognito and guest windows have an icon of their own, with a dark disc — the incognito figure or a person — and say so in the subtitle. Chrome doesn't tell which profile an incognito window came from, so all of them share that one icon. The mode is recognised from the English words; in other languages every private window is shown as incognito.
+
 ## It does not listen to your keyboard
 
 Retab asks the system for a handful of shortcuts, the way any app gets a global shortcut, and the system calls it when one is pressed. No key press passes through Retab, and it cannot delay or lose one. The extra shortcuts for moving around the panel exist only while the panel is up.

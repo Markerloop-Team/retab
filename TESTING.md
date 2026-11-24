@@ -40,6 +40,7 @@ the Mac and macOS version, and ✅ / ❌ / — (not tried). Two helpers make it 
 | 12 | Each profile is its own icon, with the account's picture and the profile's colour | 3+ profiles, windows on different desktops |
 | 13 | A window with no site open (only the new tab page) still gets its profile | |
 | 14 | Renaming a profile or changing its colour shows within a minute | |
+| 14a | An incognito window and a guest window each get their own icon, with the right disc and pill | |
 | 15 | Chrome in another language | |
 
 ## Install
@@ -71,6 +72,7 @@ the Mac and macOS version, and ✅ / ❌ / — (not tried). Two helpers make it 
 | 12 | ✅ | by the owner: Fun, Personal, markerloop.com |
 | 13 | ✅ | by the owner |
 | 14 | — | |
+| 14a | ✅ (guest) | guest window on another desktop, recognised from its toolbar: own icon, person disc, "Guest" pill. Incognito recognised from the window title by the owner's window earlier; the look not yet seen |
 | 15 | — | |
 | 16 | ✅ | clone from GitHub, `./build.sh` with no certificate: builds, signed ad hoc, icon and version in the bundle |
 | 17 | ✅ (build) | the app itself not run from that build: it would have replaced the owner's permission |
