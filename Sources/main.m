@@ -9,6 +9,7 @@
 #import <ServiceManagement/ServiceManagement.h>
 #import <QuartzCore/QuartzCore.h>
 #import <signal.h>
+#import <sys/event.h>
 
 // A line in ~/Library/Logs/Retab.log. Window titles are never written there.
 static void Log(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
@@ -62,6 +63,40 @@ static void SetSystemSwitcherEnabled(bool on) {
     CGSSetSymbolicHotKeyEnabled(kSystemAppSwitcher, on);
     CGSSetSymbolicHotKeyEnabled(kSystemAppSwitcherBackwards, on);
 }
+// A process that cannot be stopped by a signal handler — Force Quit sends SIGKILL — still must not
+// leave the Mac without Command-Tab. A small watcher, this same program started with --watch, waits
+// for Retab to end in any way and gives the system's switcher back.
+static void StartWatcher(void) {
+    static BOOL started;
+    if (started) return;
+    started = YES;
+    NSString *me = NSBundle.mainBundle.executablePath;
+    if (!me) return;
+    NSTask *task = [NSTask new];
+    task.executableURL = [NSURL fileURLWithPath:me];
+    task.arguments = @[@"--watch", [NSString stringWithFormat:@"%d", getpid()]];
+    NSError *err = nil;
+    if (![task launchAndReturnError:&err]) Log(@"watcher: could not start (%@)", err.localizedDescription);
+}
+
+static int RunWatcher(pid_t pid) {
+    int kq = kqueue();
+    struct kevent change;
+    EV_SET(&change, pid, EVFILT_PROC, EV_ADD | EV_ONESHOT, NOTE_EXIT, 0, NULL);
+    if (kq < 0 || kevent(kq, &change, 1, NULL, 0, NULL) < 0) return 1;   // already gone, or not ours to watch
+    struct kevent event;
+    kevent(kq, NULL, 0, &event, 1, NULL);
+    // Another Retab may have taken the shortcut over in the meantime; then it is that one's to keep.
+    for (NSRunningApplication *app in [NSRunningApplication runningApplicationsWithBundleIdentifier:@"app.retab.mac"])
+        if (app.processIdentifier != pid && app.processIdentifier != getpid() && !app.terminated) {
+            Log(@"watcher: Retab %d ended, another one (%d) runs; leaving Command-Tab to it", pid, app.processIdentifier);
+            return 0;
+        }
+    SetSystemSwitcherEnabled(true);
+    Log(@"watcher: Retab %d ended; the system's Command-Tab is %@", pid, CGSIsSymbolicHotKeyEnabled(kSystemAppSwitcher) ? @"back" : @"STILL OFF");
+    return 0;
+}
+
 static void OnFatalSignal(int sig) {
     if (gTookOver) SetSystemSwitcherEnabled(true);
     signal(sig, SIG_DFL);
@@ -146,10 +181,12 @@ static NSDictionary<NSNumber *, id> *AXWindowsByBruteForce(pid_t pid, NSSet<NSNu
             NSString *subrole = CFBridgingRelease(v);
             CGWindowID wid = 0;
             if (([subrole isEqual:(id)kAXStandardWindowSubrole] || [subrole isEqual:(id)kAXDialogSubrole])
-                && _AXUIElementGetWindow(el, &wid) == kAXErrorSuccess && wid) found[@(wid)] = (__bridge id)el;
+                && _AXUIElementGetWindow(el, &wid) == kAXErrorSuccess && wid && !found[@(wid)]) {
+                found[@(wid)] = (__bridge id)el;
+                if (wanted.count && [wanted isSubsetOfSet:[NSSet setWithArray:found.allKeys]]) { CFRelease(el); break; }
+            }
         }
         CFRelease(el);
-        if (wanted.count && [wanted isSubsetOfSet:[NSSet setWithArray:found.allKeys]]) break;
     }
     *complete = i > kLastNumber;
     Log(@"search in pid %d: %llu numbers in %.0f ms, %lu windows found, %lu of %lu wanted",
@@ -158,10 +195,18 @@ static NSDictionary<NSNumber *, id> *AXWindowsByBruteForce(pid_t pid, NSSet<NSNu
     return found;
 }
 
-// Profiles read off browser toolbars, by window number; an empty string while being looked for or
-// when none was found. Main thread only. ProfileOnToolbar is further down, with the profiles.
-static NSMutableDictionary<NSNumber *, NSString *> *gToolbarProfile;
-static NSString *ProfileOnToolbar(AXUIElementRef element, int depth, int *budget);
+// Profiles read off browser toolbars, by window number: the label once found, NSNull while it is
+// being looked for, or the time after which to look again (an NSDate) when nothing was found — the
+// toolbar may not have been built yet. Main thread only.
+static NSMutableDictionary<NSNumber *, id> *gToolbarProfile;
+@class BrowserProfile;
+static NSString *ProfileOnToolbar(AXUIElementRef element, int depth, int *budget, NSArray<BrowserProfile *> *profiles);
+static NSArray<BrowserProfile *> *ChromeProfiles(void);
+static NSArray<BrowserProfile *> *ChromeProfilesNamedIn(NSString *label, NSArray<BrowserProfile *> *all);
+
+// Only Google Chrome itself: its profiles are read from its own folder, and Beta, Canary and the
+// other Chromium browsers keep theirs elsewhere.
+static BOOL IsChrome(NSRunningApplication *app) { return [app.bundleIdentifier isEqual:@"com.google.Chrome"]; }
 
 // Windows found that way, by window id. Main thread only.
 static NSMutableDictionary<NSNumber *, id> *gFarWindows;
@@ -274,25 +319,35 @@ static NSArray<Win *> *ListWindows(void) {
         w.icon = running.icon;
         w.running = running;
         SplitBrowserTitle(w);
-        if (!w.profile && w.ax && [running.bundleIdentifier hasPrefix:@"com.google.Chrome"] && gToolbarProfile) {
-            NSString *known = gToolbarProfile[@(wid)];
-            if (known.length) w.profile = known;
-            else if (!known) {
-                gToolbarProfile[@(wid)] = @"";   // being looked for
+        if (!w.profile && w.ax && IsChrome(running) && gToolbarProfile) {
+            id known = gToolbarProfile[@(wid)];
+            NSArray<BrowserProfile *> *profiles = ChromeProfiles();
+            // A label read earlier counts as long as it still names a profile; renamed, it is read again.
+            if ([known isKindOfClass:NSString.class] && ChromeProfilesNamedIn(known, profiles).count) w.profile = known;
+            else if (!known || [known isKindOfClass:NSString.class] || ([known isKindOfClass:NSDate.class] && [known timeIntervalSinceNow] < 0)) {
+                gToolbarProfile[@(wid)] = NSNull.null;   // being looked for
                 id el = w.ax;
                 CGWindowID number = wid;
                 dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
                     int budget = 500;
-                    NSString *label = ProfileOnToolbar((__bridge AXUIElementRef)el, 0, &budget);
+                    NSString *label = ProfileOnToolbar((__bridge AXUIElementRef)el, 0, &budget, profiles);
                     dispatch_async(dispatch_get_main_queue(), ^{
-                        gToolbarProfile[@(number)] = label ?: @"";
-                        Log(@"window %u: profile %@ on its toolbar", number, label ? @"found" : @"not found");
+                        gToolbarProfile[@(number)] = label ?: (id)[NSDate dateWithTimeIntervalSinceNow:10];
+                        Log(@"window %u: profile %@ on its toolbar", number, label ? @"found" : @"not found, will look again");
                     });
                 });
             }
         }
         if (!w.title.length) w.title = w.appName;
         [out addObject:w];
+    }
+    // What is remembered about windows is kept only for windows that still exist.
+    if (gFarWindows) {
+        NSMutableSet<NSNumber *> *alive = [NSMutableSet set];
+        for (NSDictionary *d in info) [alive addObject:d[(id)kCGWindowNumber]];
+        for (NSNumber *wid in gFarWindows.allKeys) if (![alive containsObject:wid]) [gFarWindows removeObjectForKey:wid];
+        for (NSNumber *wid in gToolbarProfile.allKeys) if (![alive containsObject:wid]) [gToolbarProfile removeObjectForKey:wid];
+        for (NSNumber *wid in gNotWindows.allObjects) if (![alive containsObject:wid]) [gNotWindows removeObject:wid];
     }
     return out;
 }
@@ -348,6 +403,10 @@ static NSString *DockBadge(pid_t pid) {
 static NSArray<BrowserProfile *> *ChromeProfiles(void) {
     static NSArray<BrowserProfile *> *cache;
     static CFAbsoluteTime read;
+    static NSObject *lock;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ lock = [NSObject new]; });
+    @synchronized (lock) {   // read from the main thread and from background lookups alike
     if (cache && CFAbsoluteTimeGetCurrent() - read < 60) return cache;
     read = CFAbsoluteTimeGetCurrent();
     NSString *base = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/Google/Chrome"];
@@ -387,13 +446,15 @@ static NSArray<BrowserProfile *> *ChromeProfiles(void) {
         }
     }
     return cache = all;
+    }
 }
 
 // The profiles a window's title may mean. Chrome writes the profile's own name, or the account's
 // name, or "Account (profile)", depending on what tells its profiles apart. Two profiles with one
 // name get the very same label, and then both come back.
-static NSArray<BrowserProfile *> *ChromeProfilesNamed(NSString *label) {
-    NSArray<BrowserProfile *> *all = ChromeProfiles();
+static NSArray<BrowserProfile *> *ChromeProfilesNamed(NSString *label) { return ChromeProfilesNamedIn(label, ChromeProfiles()); }
+static NSArray<BrowserProfile *> *ChromeProfilesNamedIn(NSString *label, NSArray<BrowserProfile *> *all) {
+    if (!label.length) return @[];
     NSString *inner = nil;
     NSRange open = [label rangeOfString:@" (" options:NSBackwardsSearch];
     if (open.location != NSNotFound && [label hasSuffix:@")"])
@@ -410,7 +471,7 @@ static NSArray<BrowserProfile *> *ChromeProfilesNamed(NSString *label) {
 // Space — still shows its profile on the toolbar's profile button. Its label is looked for among the
 // window's buttons; one that names a known profile is the answer. Walks part of the window's
 // accessibility tree, so it runs off the main thread, once per window.
-static NSString *ProfileOnToolbar(AXUIElementRef element, int depth, int *budget) {
+static NSString *ProfileOnToolbar(AXUIElementRef element, int depth, int *budget, NSArray<BrowserProfile *> *profiles) {
     if (depth > 10 || *budget <= 0) return nil;
     (*budget)--;
     CFTypeRef v = NULL;
@@ -421,14 +482,14 @@ static NSString *ProfileOnToolbar(AXUIElementRef element, int depth, int *budget
         v = NULL;
         if (AXUIElementCopyAttributeValue(element, kAXTitleAttribute, &v) == kAXErrorSuccess && v) {
             NSString *title = CFBridgingRelease(v);
-            if ([title isKindOfClass:NSString.class] && title.length && ChromeProfilesNamed(title).count) return title;
+            if ([title isKindOfClass:NSString.class] && title.length && ChromeProfilesNamedIn(title, profiles).count) return title;
         }
         return nil;
     }
     CFTypeRef children = NULL;
     if (AXUIElementCopyAttributeValue(element, kAXChildrenAttribute, &children) != kAXErrorSuccess || !children) return nil;
     NSString *found = nil;
-    for (id child in (__bridge NSArray *)children) if ((found = ProfileOnToolbar((__bridge AXUIElementRef)child, depth + 1, budget))) break;
+    for (id child in (__bridge NSArray *)children) if ((found = ProfileOnToolbar((__bridge AXUIElementRef)child, depth + 1, budget, profiles))) break;
     CFRelease(children);
     return found;
 }
@@ -756,8 +817,9 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *re
 
 - (void)applicationDidFinishLaunching:(NSNotification *)n {
     _recent = [NSMutableArray array];
-    // `Retab --dump <file>` asks this running copy to write its diagnostics there. For debugging;
-    // the file holds window titles, so whoever asks for it should also delete it.
+    // `Retab --dump` asks this running copy to write its diagnostics to ~/Library/Logs/Retab-diagnostics.txt,
+    // readable by this user only. For debugging; the file holds window titles, so delete it after.
+    // It is always that file: the request comes from anyone on this Mac, so it cannot name a path.
     // `Retab --show` asks this running copy to put the panel up for two seconds, as if the keys
     // were held. For debugging the panel without touching the keyboard.
     [NSDistributedNotificationCenter.defaultCenter addObserverForName:@"app.retab.mac.show" object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
@@ -766,10 +828,15 @@ static OSStatus HotKeyPressed(EventHandlerCallRef next, EventRef event, void *re
         [self beginSwitch:NO];
         [self->_releaseTimer invalidate];   // nobody is holding a key: keep it up on a timer instead
         self->_releaseTimer = nil;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{ [self endSwitch]; });
+        NSUInteger round = self->_round;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            if (self->_active && self->_round == round) [self endSwitch];   // not a switch somebody started since
+        });
     }];
     [NSDistributedNotificationCenter.defaultCenter addObserverForName:@"app.retab.mac.dump" object:nil queue:NSOperationQueue.mainQueue usingBlock:^(NSNotification *note) {
-        if ([note.object isKindOfClass:NSString.class]) [[self diagnostics] writeToFile:note.object atomically:YES encoding:NSUTF8StringEncoding error:nil];
+        NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Logs/Retab-diagnostics.txt"];
+        NSData *text = [[self diagnostics] dataUsingEncoding:NSUTF8StringEncoding];
+        [NSFileManager.defaultManager createFileAtPath:path contents:text attributes:@{NSFilePosixPermissions: @0600}];
     }];
     gNowPlaying = [NSMutableDictionary dictionary];
     for (NSArray<NSString *> *player in @[@[@"com.apple.Music.playerInfo", @"com.apple.Music"], @[@"com.spotify.client.PlaybackStateChanged", @"com.spotify.client"]]) {
@@ -887,6 +954,7 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
     Log(@"the system switches apps with %@; taking it over", ShortcutName(key, flags));
     SetSystemSwitcherEnabled(false);
     gTookOver = YES;
+    StartWatcher();
     [self setShortcut:key flags:flags];
 
     _testing = YES;
@@ -914,6 +982,9 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
 }
 
 - (void)syncPermissions {
+    // Something else (a watcher left from an earlier run, the user in Terminal) may have turned the
+    // system's switcher back on while we hold its shortcut; turn it off again.
+    if (gTookOver && CGSIsSymbolicHotKeyEnabled(kSystemAppSwitcher)) SetSystemSwitcherEnabled(false);
     BOOL trusted = AXIsProcessTrusted();
     if (trusted == _trusted) return;
     _trusted = trusted;
@@ -968,16 +1039,8 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
     [_recent insertObject:@(wid) atIndex:0];
 }
 
-- (void)beginSwitch:(BOOL)backwards {
-    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
-    NSArray<Win *> *all = ListWindows();
-    Log(@"switch: %lu windows listed in %.0f ms", (unsigned long)all.count, (CFAbsoluteTimeGetCurrent() - t0) * 1000);
-    // The window in front right now is where we are; it goes first whatever the history says.
-    NSRunningApplication *front = NSWorkspace.sharedWorkspace.frontmostApplication;
-    Win *here = nil;
-    for (Win *w in all) if (w.pid == front.processIdentifier && (w.near || !here)) { here = w; if (w.near) break; }
-    if (here) [self touch:here.wid];
-
+// One icon per app — and per profile, for a browser — most recently used first.
+- (NSArray<Win *> *)iconsFrom:(NSArray<Win *> *)all {
     // Most recently used first; windows we have never seen follow in the system's own order.
     NSMutableArray<Win *> *sorted = [NSMutableArray array];
     NSMutableDictionary<NSNumber *, Win *> *byId = [NSMutableDictionary dictionary];
@@ -985,7 +1048,7 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
     for (NSNumber *wid in _recent.copy) {
         Win *w = byId[wid];
         if (w) { [sorted addObject:w]; [byId removeObjectForKey:wid]; }
-        else { [_recent removeObject:wid]; [gFarWindows removeObjectForKey:wid]; }
+        else [_recent removeObject:wid];
     }
     for (Win *w in all) if (byId[@(w.wid)]) [sorted addObject:w];
 
@@ -995,14 +1058,14 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
         for (Win *w in sorted) if ([w.appName isEqual:@"Google Chrome"]) w.profile = sample[k++ % sample.count];
     }
 
-    // One icon per app — and per profile, for a browser. It stands for the most recently used
-    // window of that app or profile, so the icons come in the order their windows were used.
+    // It stands for the most recently used window of that app or profile, so the icons come in the
+    // order their windows were used.
     NSMutableArray<Win *> *icons = [NSMutableArray array];
     NSArray *displays = CFBridgingRelease(CGSCopyManagedDisplaySpaces(CGSMainConnectionID()));
     NSMutableDictionary<NSString *, Win *> *byGroup = [NSMutableDictionary dictionary];
     NSMutableSet<NSNumber *> *withWindows = [NSMutableSet set];
     for (Win *w in sorted) {
-        BrowserProfile *profile = (w.profile && [w.running.bundleIdentifier isEqual:@"com.google.Chrome"]) ? ChromeProfileOfWindow(w) : nil;
+        BrowserProfile *profile = (w.profile && IsChrome(w.running)) ? ChromeProfileOfWindow(w) : nil;
         if (profile) {
             w.avatar = profile.picture;
             w.email = profile.email;
@@ -1036,7 +1099,33 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
         w.badge = DockBadge(w.pid);
         [icons addObject:w];
     }
-    sorted = icons;
+    return icons;
+}
+
+// The search found windows while the panel is up: rebuild the row with them, keeping the selection.
+- (void)refreshOpenSwitch {
+    if (!_active) return;
+    NSString *chosen = (_selected >= 0 && _selected < (NSInteger)_items.count) ? _items[_selected].group : nil;
+    NSArray<Win *> *icons = [self iconsFrom:ListWindows()];
+    if (icons.count == _items.count) return;
+    _items = icons;
+    _selected = 0;
+    for (NSInteger i = 0; i < (NSInteger)icons.count; i++) if ([icons[i].group isEqual:chosen]) { _selected = i; break; }
+    Log(@"switch: %lu icons after the search", (unsigned long)icons.count);
+    if (_shown) [self layoutPanel];
+}
+
+- (void)beginSwitch:(BOOL)backwards {
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+    NSArray<Win *> *all = ListWindows();
+    Log(@"switch: %lu windows listed in %.0f ms", (unsigned long)all.count, (CFAbsoluteTimeGetCurrent() - t0) * 1000);
+    // The window in front right now is where we are; it goes first whatever the history says.
+    NSRunningApplication *front = NSWorkspace.sharedWorkspace.frontmostApplication;
+    Win *here = nil;
+    for (Win *w in all) if (w.pid == front.processIdentifier && (w.near || !here)) { here = w; if (w.near) break; }
+    if (here) [self touch:here.wid];
+
+    NSArray<Win *> *sorted = [self iconsFrom:all];
     Win *previous = sorted.count > 1 ? sorted[1] : nil;
     _items = sorted;
     _active = YES;
@@ -1152,6 +1241,13 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
         _panel.contentView = content;
     }
 
+    [self layoutPanel];
+    CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), (int)_panel.windowNumber, 22);
+    [self arrive];
+}
+
+// Sizes the panel to its icons and the screen, and puts it in the middle of that screen.
+- (void)layoutPanel {
     // On the screen the pointer is on: with two monitors that is the one you are looking at.
     NSPoint mouse = NSEvent.mouseLocation;
     NSScreen *screen = NSScreen.mainScreen;
@@ -1174,7 +1270,9 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
     NSRect frame = NSMakeRect(NSMidX(vis) - size.width / 2, NSMidY(vis) - size.height / 2, size.width, size.height);
     [_panel setFrame:frame display:YES];
     _view.frame = _panel.contentView.bounds;
-    CGSSetWindowBackgroundBlurRadius(CGSMainConnectionID(), (int)_panel.windowNumber, 22);
+}
+
+- (void)arrive {
     // It arrives rather than appears: a short fade, rising a few points into place. The animation is
     // on the layer and leaves nothing behind: the window itself is always fully there, so whatever
     // happens to an animation — cut short, overtaken by the next switch — the panel cannot end up
@@ -1239,17 +1337,19 @@ static NSString *ShortcutName(UInt32 key, CGEventFlags flags) {
                 [gFarWindows addEntriesFromDictionary:found];
                 if (all) [lastTry removeObjectForKey:pid]; else lastTry[pid] = @(CFAbsoluteTimeGetCurrent());
                 // Having asked the app about everything it has: what it did not name is not a window.
-                if (complete) for (NSNumber *wid in these) if (!found[wid]) {
+                // What the app did not name after the whole range — or after two full searches — is
+                // not a window anybody switches to; it is no longer looked for.
+                static NSMutableDictionary<NSNumber *, NSNumber *> *misses;
+                if (!misses) misses = [NSMutableDictionary dictionary];
+                for (NSNumber *wid in these) if (!found[wid]) {
+                    NSInteger n = misses[wid].integerValue + 1;
+                    misses[wid] = @(n);
+                    if (!complete && n < 2) continue;
                     [gNotWindows addObject:wid];
+                    [misses removeObjectForKey:wid];
                     Log(@"window %@ of pid %@ is not a real window; leaving it out", wid, pid);
                 }
-                for (Win *w in self->_items) {
-                    if (w.ax || !found[@(w.wid)]) continue;
-                    w.ax = found[@(w.wid)];
-                    ReadTitle(w);
-                    SplitBrowserTitle(w);
-                    self->_view.needsDisplay = YES;
-                }
+                if (found.count) [self refreshOpenSwitch];
             });
         });
     }
@@ -1335,7 +1435,7 @@ static void DescribeControls(AXUIElementRef element, int depth, int *budget, NSM
         [out appendFormat:@"%u  %@  %@\n    shown: %@ | profile: %@\n    accessibility title (error %d): %@\n",
             w.wid, w.appName, w.near ? @"this space" : (w.ax ? @"other space" : @"other space, NOT reached"),
             w.title, w.profile ?: @"-", err, axTitle];
-        if (w.ax && [w.running.bundleIdentifier hasPrefix:@"com.google.Chrome"]) {
+        if (w.ax && IsChrome(w.running)) {
             int budget = 600;
             DescribeControls((__bridge AXUIElementRef)w.ax, 0, &budget, out);
         }
@@ -1360,12 +1460,14 @@ int main(int argc, const char *argv[]) {
                        w.title.UTF8String, w.near ? "" : (w.ax ? "\t(other space)" : "\t(other space, not reached yet)"));
             return 0;
         }
+        if (argc > 2 && strcmp(argv[1], "--watch") == 0) return RunWatcher(atoi(argv[2]));
         if (argc > 1 && strcmp(argv[1], "--show") == 0) {
             [NSDistributedNotificationCenter.defaultCenter postNotificationName:@"app.retab.mac.show" object:nil userInfo:nil deliverImmediately:YES];
             return 0;
         }
-        if (argc > 2 && strcmp(argv[1], "--dump") == 0) {
-            [NSDistributedNotificationCenter.defaultCenter postNotificationName:@"app.retab.mac.dump" object:@(argv[2]) userInfo:nil deliverImmediately:YES];
+        if (argc > 1 && strcmp(argv[1], "--dump") == 0) {
+            [NSDistributedNotificationCenter.defaultCenter postNotificationName:@"app.retab.mac.dump" object:nil userInfo:nil deliverImmediately:YES];
+            printf("%s/Library/Logs/Retab-diagnostics.txt\n", NSHomeDirectory().UTF8String);
             return 0;
         }
         NSApplication *app = NSApplication.sharedApplication;
