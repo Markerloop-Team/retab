@@ -4,7 +4,7 @@
 
 **Command-Tab, with every Chrome profile as its own icon.** A small, free, open-source Mac app that replaces the system's app switcher with one that looks and works the same — a row of icons, hold the keys, let go to switch — except that a browser with several profiles shows one icon per profile, with the account's picture and the profile's colour.
 
-<img src="docs/panel.png" width="720" alt="The Retab panel: a row of app icons, three of them Chrome with different profiles">
+<img src="docs/press/retab-wide-1600x900.png" width="800" alt="Retab: Command-Tab that knows your Chrome profiles. The panel shows a row of app icons, four of them Chrome — Work, Personal, Client and incognito">
 
 *Retab*: Tab, done again. Made by [Markerloop](https://markerloop.com).
 
